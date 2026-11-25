@@ -8,7 +8,7 @@
 // Standalone experiment. No Substrate dependency and no network interception.
 static __weak id preferences;
 static __weak id latestManifest;
-static atomic_uint metadataReads, manifestReads;
+static atomic_uint metadataReads, manifestReads, playbackErrors;
 static BOOL nativeCapabilityVerified;
 static NSMutableArray<NSString *> *events;
 static NSMutableDictionary<NSString *, NSString *> *lastStates;
@@ -145,7 +145,10 @@ static void hookPreferences(void) {
 
 static void observeMetadata(id value) {
     if (![value isKindOfClass:NSDictionary.class]) return;
-    atomic_fetch_add(&metadataReads,1);
+    unsigned sample=atomic_fetch_add(&metadataReads,1);
+    // The skip loop can read metadata thousands of times a second. Count all
+    // reads but limit diagnostic dictionary processing to one in every 64.
+    if (sample%64) return;
     NSUInteger present=0;
     // Deliberately exclude URLs, tokens, IDs, titles and other account metadata.
     for (NSString *key in @[@"source_is_lossless", @"audio_quality", @"bitrate", @"audio_bitrate", @"codec", @"codec_name", @"file_type", @"sample_rate", @"bits_per_sample"]) {
@@ -156,6 +159,51 @@ static void observeMetadata(id value) {
         }
     }
     recordState(@"metadata schema",[NSString stringWithFormat:@"metadata dictionary observed; allowed audio fields present=%lu",(unsigned long)present]);
+}
+
+static NSString *safeErrorDomain(NSString *domain) {
+    if (![domain isKindOfClass:NSString.class] || domain.length>128) return @"redacted";
+    static NSCharacterSet *allowed;
+    static dispatch_once_t once;
+    dispatch_once(&once,^{allowed=[NSCharacterSet characterSetWithCharactersInString:@"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"];});
+    return [domain rangeOfCharacterFromSet:allowed.invertedSet].location==NSNotFound?domain:@"redacted";
+}
+
+static void observePlaybackError(NSString *source,id error) {
+    atomic_fetch_add(&playbackErrors,1);
+    if (![error isKindOfClass:NSError.class]) {
+        recordState([@"playback error " stringByAppendingString:source],[NSString stringWithFormat:@"PLAYBACK_ERROR source=%@ class=%@ (not NSError; no arbitrary fields read)",source,error?NSStringFromClass(object_getClass(error)):@"nil"]);
+        return;
+    }
+    NSError *current=error;
+    for (unsigned depth=0;current && depth<3;depth++) {
+        NSString *line=[NSString stringWithFormat:@"PLAYBACK_ERROR source=%@ depth=%u domain=%@ code=%ld",source,depth,safeErrorDomain(current.domain),(long)current.code];
+        recordState([NSString stringWithFormat:@"playback error %@ %u",source,depth],line);
+        id underlying=current.userInfo[NSUnderlyingErrorKey];
+        if (![underlying isKindOfClass:NSError.class] || underlying==current) break;
+        current=underlying;
+    }
+}
+
+static void hookPlaybackErrors(void) {
+    for (NSString *name in @[@"_TtC23NowPlaying_PlatformImpl28StatefulPlayerImplementation",@"SPTPlaybackErrorPicker",@"SPTExternalIntegrationPlaybackControllerImplementation"]) {
+        Class cls=NSClassFromString(name);
+        SEL selector=NSSelectorFromString(@"player:didEncounterError:");
+        Method method=cls?class_getInstanceMethod(cls,selector):NULL;
+        char type[128]={0};
+        BOOL matches=method && method_getNumberOfArguments(method)==4;
+        if (matches) {method_getReturnType(method,type,sizeof(type));matches=!strcmp(type,"v");}
+        for (unsigned i=2;matches && i<4;i++) {
+            method_getArgumentType(method,i,type,sizeof(type)); matches=type[0]=='@';
+        }
+        if (!matches) {record([@"playback error observer ABI unavailable " stringByAppendingString:name]);continue;}
+        IMP original=method_getImplementation(method);
+        replace(cls,selector,imp_implementationWithBlock(^(id object,id player,id error) {
+            observePlaybackError(name,error);
+            // Observe only. Always forward, never swallow errors or force retry.
+            ((void(*)(id,SEL,id,id))original)(object,selector,player,error);
+        }),method);
+    }
 }
 
 static void hookManifest(void) {
@@ -279,7 +327,7 @@ static NSString *snapshot(NSString *reason) {
             [lines addObject:[NSString stringWithFormat:@"SNAPSHOT %@=%ld",name,(long)((NSInteger(*)(id,SEL))objc_msgSend)(object,selector)]];
     }
     for (NSString *line in lines) record(line);
-    record([NSString stringWithFormat:@"OBSERVERS metadata dictionaries=%u manifest calls=%u native-capability-patch=%@",atomic_load(&metadataReads),atomic_load(&manifestReads),nativeCapabilityVerified?@"verified-local-2":@"unverified-or-absent"]);
+    record([NSString stringWithFormat:@"OBSERVERS metadata dictionaries=%u manifest calls=%u playback error callbacks=%u native-capability-patch=%@",atomic_load(&metadataReads),atomic_load(&manifestReads),atomic_load(&playbackErrors),nativeCapabilityVerified?@"verified-local-2":@"unverified-or-absent"]);
     id manifest=latestManifest;
     if (manifest) for (NSString *name in @[@"bitrate",@"mimeType"]) {
         SEL selector=NSSelectorFromString(name);
@@ -342,7 +390,7 @@ static void writeQuality(NSInteger value) {
 @implementation QLController
 + (void)show {
     NSString *nativeNote=nativeCapabilityVerified?@"此包含固定原生能力补丁；关闭属性修改不会撤销，需原包恢复。":@"未确认原生能力补丁。";
-    UIAlertController *menu = [UIAlertController alertControllerWithTitle:@"Quality Lab 0.3 · 实验版" message:[NSString stringWithFormat:@"当前：%@\n%@\n实际音源质量：尚未验证。", experiment ? @"尝试修改客户端属性" : @"观察本地读值",nativeNote] preferredStyle:UIAlertControllerStyleActionSheet];
+    UIAlertController *menu = [UIAlertController alertControllerWithTitle:@"Quality Lab 0.4 · 错误诊断版" message:[NSString stringWithFormat:@"当前：%@\n%@\n实际音源质量：尚未验证。", experiment ? @"尝试修改客户端属性" : @"观察本地读值",nativeNote] preferredStyle:UIAlertControllerStyleActionSheet];
     [menu addAction:[UIAlertAction actionWithTitle:@"读取当前状态（不修改）" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
         message(snapshot(@"manual-read-current"));
     }]];
@@ -400,12 +448,12 @@ __attribute__((constructor)) static void startQualityLab(void) {
         NSDictionary *info=NSBundle.mainBundle.infoDictionary;
         if (![info[@"CFBundleExecutable"] isEqual:@"Spotify"]) return;
         experiment=[NSUserDefaults.standardUserDefaults boolForKey:@"QualityLabExperiment"];
-        record([NSString stringWithFormat:@"QualityLab 0.3 app=%@ build=%@ mode=%@; actual source quality UNKNOWN",info[@"CFBundleShortVersionString"],info[@"CFBundleVersion"],experiment?@"experiment":@"observation"]);
+        record([NSString stringWithFormat:@"QualityLab 0.4 app=%@ build=%@ mode=%@; actual source quality UNKNOWN",info[@"CFBundleShortVersionString"],info[@"CFBundleVersion"],experiment?@"experiment":@"observation"]);
         if (![info[@"CFBundleShortVersionString"] isEqual:@"9.2.2"]) {
             record(@"Unsupported version: hooks disabled");
         } else {
             nativeCapabilityVerified=verifyNativeCapability();
-            hookProduct(); hookPreferences(); hookTrackMetadata(); hookManifest();
+            hookProduct(); hookPreferences(); hookTrackMetadata(); hookManifest(); hookPlaybackErrors();
         }
         [NSNotificationCenter.defaultCenter addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n) { attachButton(); }];
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3*NSEC_PER_SEC),dispatch_get_main_queue(),^{ attachButton(); });
