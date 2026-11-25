@@ -27,7 +27,7 @@ jobs:
       - name: Validate binary and sign for injection
         run: |
           file dist/QualityLab.dylib | tee dist/binary-info.txt
-          lipo -verify_arch arm64 dist/QualityLab.dylib
+          lipo dist/QualityLab.dylib -verify_arch arm64
           otool -L dist/QualityLab.dylib | tee -a dist/binary-info.txt
           codesign --force --sign - dist/QualityLab.dylib
           codesign --verify --strict --verbose=2 dist/QualityLab.dylib
