@@ -8,6 +8,7 @@ from pathlib import Path
 import plistlib
 import struct
 import zipfile
+from native_capability import patch_native_capability
 
 
 def inject(binary, library_path):
@@ -61,6 +62,8 @@ def main():
     parser.add_argument('ipa', type=Path)
     parser.add_argument('dylib', type=Path)
     parser.add_argument('output', type=Path)
+    parser.add_argument('--native-capability-2', action='store_true',
+                        help='Patch the exact original 9.2.2 native capability getter; always active until original IPA is restored')
     args = parser.parse_args()
     if args.output.resolve() == args.ipa.resolve() or args.output.exists():
         raise ValueError('Output must be a new file')
@@ -81,12 +84,21 @@ def main():
         target = app + '/Frameworks/QualityLab.dylib'
         if target in source.namelist():
             raise ValueError('Target library already exists')
-        patched = inject(source.read(executable), '@executable_path/Frameworks/QualityLab.dylib')
+        original = source.read(executable)
+        if args.native_capability_2:
+            original = patch_native_capability(original)
+            info['QualityLabNativeCapability'] = 2
+        patched = inject(original, '@executable_path/Frameworks/QualityLab.dylib')
         with zipfile.ZipFile(args.output, 'x', zipfile.ZIP_DEFLATED, compresslevel=6) as output:
             for entry in source.infolist():
                 if entry.filename.startswith(app + '/_CodeSignature/'):
                     continue
-                output.writestr(entry, patched if entry.filename == executable else source.read(entry))
+                data = source.read(entry)
+                if entry.filename == executable:
+                    data = patched
+                elif entry.filename == infos[0] and args.native_capability_2:
+                    data = plistlib.dumps(info, fmt=plistlib.FMT_BINARY)
+                output.writestr(entry, data)
             entry = zipfile.ZipInfo(target)
             entry.external_attr = 0o100755 << 16
             entry.compress_type = zipfile.ZIP_DEFLATED

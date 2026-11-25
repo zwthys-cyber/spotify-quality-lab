@@ -3,9 +3,13 @@
 #import <objc/message.h>
 #import <string.h>
 #import <stdatomic.h>
+#import <mach-o/dyld.h>
 
 // Standalone experiment. No Substrate dependency and no network interception.
 static __weak id preferences;
+static __weak id latestManifest;
+static atomic_uint metadataReads, manifestReads;
+static BOOL nativeCapabilityVerified;
 static NSMutableArray<NSString *> *events;
 static NSMutableDictionary<NSString *, NSString *> *lastStates;
 static NSLock *eventLock;
@@ -56,6 +60,7 @@ static NSString *forcedValue(NSString *key) {
     if (!experiment || ![key isKindOfClass:NSString.class]) return nil;
     // These are local experiments, never evidence of a server entitlement.
     if ([key isEqual:@"high-bitrate"] || [key isEqual:@"very-high-bitrate"]) return @"1";
+    if ([key isEqual:@"audio-quality"]) return @"2";
     if ([key isEqual:@"type"] || [key isEqual:@"product"] || [key isEqual:@"catalogue"]) return @"premium";
     return nil;
 }
@@ -74,7 +79,7 @@ static id productDictionary(id original) {
     }
     if (!experiment) return original;
     NSMutableDictionary *result = input.mutableCopy;
-    for (NSString *key in @[@"type", @"product", @"catalogue", @"high-bitrate", @"very-high-bitrate"])
+    for (NSString *key in @[@"type", @"product", @"catalogue", @"high-bitrate", @"very-high-bitrate", @"audio-quality"])
         result[key] = forcedValue(key);
     return result;
 }
@@ -92,7 +97,10 @@ static void hookProduct(void) {
             if ([key isKindOfClass:NSString.class] && relevantKey(key) &&
                 ([value isKindOfClass:NSString.class] || [value isKindOfClass:NSNumber.class]))
                 recordState([NSString stringWithFormat:@"account %p %@ %@", (__bridge void *)object,name,key], [NSString stringWithFormat:@"account LOCAL_INPUT %@ %@=%@", name,key,value]);
-            return forcedValue(key) ?: value;
+            NSString *forced=forcedValue(key);
+            if (forced && [key isEqual:@"audio-quality"])
+                recordState(@"audio-quality output", [NSString stringWithFormat:@"account LOCAL_OUTPUT audio-quality=%@ (client only)",forced]);
+            return forced ?: value;
         });
         replace(cls, selector, replacement, method);
     }
@@ -137,12 +145,82 @@ static void hookPreferences(void) {
 
 static void observeMetadata(id value) {
     if (![value isKindOfClass:NSDictionary.class]) return;
+    atomic_fetch_add(&metadataReads,1);
+    NSUInteger present=0;
     // Deliberately exclude URLs, tokens, IDs, titles and other account metadata.
     for (NSString *key in @[@"source_is_lossless", @"audio_quality", @"bitrate", @"audio_bitrate", @"codec", @"codec_name", @"file_type", @"sample_rate", @"bits_per_sample"]) {
         id item = value[key];
-        if ([item isKindOfClass:NSString.class] || [item isKindOfClass:NSNumber.class])
+        if ([item isKindOfClass:NSString.class] || [item isKindOfClass:NSNumber.class]) {
+            present++;
             recordState([@"metadata " stringByAppendingString:key], [NSString stringWithFormat:@"player METADATA %@=%@ (reported; not independently verified)",key,item]);
+        }
     }
+    recordState(@"metadata schema",[NSString stringWithFormat:@"metadata dictionary observed; allowed audio fields present=%lu",(unsigned long)present]);
+}
+
+static void hookManifest(void) {
+    Class cls=NSClassFromString(@"SPTPlayerMediaManifest");
+    if (!cls) { record(@"manifest observer: class absent"); return; }
+    SEL bitrate=NSSelectorFromString(@"bitrate");
+    Method method=class_getInstanceMethod(cls,bitrate);
+    if (abi(method,@encode(NSUInteger),NULL)) {
+        IMP original=method_getImplementation(method);
+        replace(cls,bitrate,imp_implementationWithBlock(^NSUInteger(id object) {
+            latestManifest=object; atomic_fetch_add(&manifestReads,1);
+            NSUInteger value=((NSUInteger(*)(id,SEL))original)(object,bitrate);
+            recordState([NSString stringWithFormat:@"manifest %p bitrate",(__bridge void *)object],[NSString stringWithFormat:@"MANIFEST object=%p bitrate=%lu (advertised; units and active playback unverified)",(__bridge void *)object,(unsigned long)value]);
+            return value;
+        }),method);
+    }
+    SEL setter=NSSelectorFromString(@"setBitrate:");
+    method=class_getInstanceMethod(cls,setter);
+    if (abi(method,"v",@encode(NSUInteger))) {
+        IMP original=method_getImplementation(method);
+        replace(cls,setter,imp_implementationWithBlock(^(id object,NSUInteger value) {
+            latestManifest=object; atomic_fetch_add(&manifestReads,1);
+            record([NSString stringWithFormat:@"MANIFEST SET object=%p bitrate=%lu (advertised only)",(__bridge void *)object,(unsigned long)value]);
+            ((void(*)(id,SEL,NSUInteger))original)(object,setter,value);
+        }),method);
+    }
+    SEL mime=NSSelectorFromString(@"mimeType");
+    method=class_getInstanceMethod(cls,mime);
+    if (abi(method,"@",NULL)) {
+        IMP original=method_getImplementation(method);
+        replace(cls,mime,imp_implementationWithBlock(^id(id object) {
+            latestManifest=object; atomic_fetch_add(&manifestReads,1);
+            id value=((id(*)(id,SEL))original)(object,mime);
+            if ([value isKindOfClass:NSString.class] && [value length]<128 && ([value hasPrefix:@"audio/"] || [value hasPrefix:@"application/"]))
+                recordState([NSString stringWithFormat:@"manifest %p mime",(__bridge void *)object],[NSString stringWithFormat:@"MANIFEST mime=%@ (advertised only)",value]);
+            return value;
+        }),method);
+    }
+}
+
+static BOOL verifyNativeCapability(void) {
+    NSDictionary *info=NSBundle.mainBundle.infoDictionary;
+    if ([info[@"QualityLabNativeCapability"] integerValue]!=2) {
+        record(@"NATIVE_CAPABILITY no packaging marker; ordinary dylib injection cannot apply the native static patch");
+        return NO;
+    }
+    const struct mach_header_64 *header=(const struct mach_header_64 *)_dyld_get_image_header(0);
+    if (!header || header->magic!=MH_MAGIC_64) return NO;
+    const uint8_t *cursor=(const uint8_t *)(header+1);
+    const uint64_t target=0x9307988;
+    for (uint32_t i=0;i<header->ncmds;i++) {
+        const struct load_command *cmd=(const struct load_command *)cursor;
+        if (cmd->cmd==LC_SEGMENT_64) {
+            const struct segment_command_64 *segment=(const struct segment_command_64 *)cursor;
+            if (segment->fileoff==0 && !strncmp(segment->segname,"__TEXT",16) && target+8<=segment->filesize) {
+                const uint8_t expected[8]={0x40,0x00,0x80,0x52,0xc0,0x03,0x5f,0xd6};
+                BOOL matches=!memcmp((const uint8_t *)header+target,expected,sizeof(expected));
+                record(matches?@"NATIVE_CAPABILITY live entry verified: local getter returns 2; NOT server entitlement or stream quality":@"NATIVE_CAPABILITY WARNING packaging marker exists but live code does not match");
+                return matches;
+            }
+        }
+        cursor+=cmd->cmdsize;
+    }
+    record(@"NATIVE_CAPABILITY unable to verify live code bounds");
+    return NO;
 }
 
 static void hookTrackMetadata(void) {
@@ -201,6 +279,16 @@ static NSString *snapshot(NSString *reason) {
             [lines addObject:[NSString stringWithFormat:@"SNAPSHOT %@=%ld",name,(long)((NSInteger(*)(id,SEL))objc_msgSend)(object,selector)]];
     }
     for (NSString *line in lines) record(line);
+    record([NSString stringWithFormat:@"OBSERVERS metadata dictionaries=%u manifest calls=%u native-capability-patch=%@",atomic_load(&metadataReads),atomic_load(&manifestReads),nativeCapabilityVerified?@"verified-local-2":@"unverified-or-absent"]);
+    id manifest=latestManifest;
+    if (manifest) for (NSString *name in @[@"bitrate",@"mimeType"]) {
+        SEL selector=NSSelectorFromString(name);
+        Method method=class_getInstanceMethod(object_getClass(manifest),selector);
+        if ([name isEqual:@"bitrate"] && abi(method,@encode(NSUInteger),NULL))
+            (void)((NSUInteger(*)(id,SEL))objc_msgSend)(manifest,selector);
+        else if ([name isEqual:@"mimeType"] && abi(method,"@",NULL))
+            (void)((id(*)(id,SEL))objc_msgSend)(manifest,selector);
+    }
     return [lines componentsJoinedByString:@"\n"];
 }
 
@@ -253,7 +341,8 @@ static void writeQuality(NSInteger value) {
 @end
 @implementation QLController
 + (void)show {
-    UIAlertController *menu = [UIAlertController alertControllerWithTitle:@"Quality Lab 0.2 · 实验版" message:[NSString stringWithFormat:@"当前：%@\n实际音源质量：尚未验证\n枚举 3/4/5 需用本机设置标签核对。", experiment ? @"尝试修改客户端属性" : @"只观察"] preferredStyle:UIAlertControllerStyleActionSheet];
+    NSString *nativeNote=nativeCapabilityVerified?@"此包含固定原生能力补丁；关闭属性修改不会撤销，需原包恢复。":@"未确认原生能力补丁。";
+    UIAlertController *menu = [UIAlertController alertControllerWithTitle:@"Quality Lab 0.3 · 实验版" message:[NSString stringWithFormat:@"当前：%@\n%@\n实际音源质量：尚未验证。", experiment ? @"尝试修改客户端属性" : @"观察本地读值",nativeNote] preferredStyle:UIAlertControllerStyleActionSheet];
     [menu addAction:[UIAlertAction actionWithTitle:@"读取当前状态（不修改）" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
         message(snapshot(@"manual-read-current"));
     }]];
@@ -311,11 +400,12 @@ __attribute__((constructor)) static void startQualityLab(void) {
         NSDictionary *info=NSBundle.mainBundle.infoDictionary;
         if (![info[@"CFBundleExecutable"] isEqual:@"Spotify"]) return;
         experiment=[NSUserDefaults.standardUserDefaults boolForKey:@"QualityLabExperiment"];
-        record([NSString stringWithFormat:@"QualityLab 0.2 app=%@ build=%@ mode=%@; actual source quality UNKNOWN",info[@"CFBundleShortVersionString"],info[@"CFBundleVersion"],experiment?@"experiment":@"observation"]);
+        record([NSString stringWithFormat:@"QualityLab 0.3 app=%@ build=%@ mode=%@; actual source quality UNKNOWN",info[@"CFBundleShortVersionString"],info[@"CFBundleVersion"],experiment?@"experiment":@"observation"]);
         if (![info[@"CFBundleShortVersionString"] isEqual:@"9.2.2"]) {
             record(@"Unsupported version: hooks disabled");
         } else {
-            hookProduct(); hookPreferences(); hookTrackMetadata();
+            nativeCapabilityVerified=verifyNativeCapability();
+            hookProduct(); hookPreferences(); hookTrackMetadata(); hookManifest();
         }
         [NSNotificationCenter.defaultCenter addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n) { attachButton(); }];
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3*NSEC_PER_SEC),dispatch_get_main_queue(),^{ attachButton(); });
