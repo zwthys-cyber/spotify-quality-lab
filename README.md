@@ -1,4 +1,4 @@
-# Quality Lab 0.4 — Spotify 9.2.2 experiment
+# Quality Lab 0.5 — Spotify 9.2.2 experiment
 
 实验插件，不是已验证的超高／无损解锁。编译仅在 GitHub Actions macOS runner 执行；没有在本地编译或测试。只依赖系统 Foundation/UIKit，可用全能签向解密的 9.2.2 IPA 注入 `QualityLab.dylib`，然后重新签名安装。安装成功与音质解锁是两项独立结果。
 
@@ -44,3 +44,11 @@
 0.4 保留完全相同的能力修改，新增三处 `player:didEncounterError:` 观察接口，核对 ABI，始终向原实现转发所有参数。只记录 NSError 的错误域、错误码和最多两层 underlying error，不记录 localizedDescription、URL、凭证、完整 userInfo，不吞掉错误、不改变重试或跳歌行为。元数据读取保留总计数，每 64 次采样一次以减少连续跳歌期间的诊断开销。
 
 安装后先确认高档正常播放，再切超高复现约 5–10 秒；一旦连续跳歌立即暂停，切回高档恢复，然后导出日志。若没有 `PLAYBACK_ERROR`，日志会显示 error callbacks=0，需要另外定位错误通道；不得将它解释成没有错误或已成功播放。
+
+## 0.5 详细禁止原因
+
+0.4 实机在选择超高后捕获 `com.spotify.SPTPlayer code=101`，三个观察点均收到相同错误；51 次回调包含多个观察者的重复报告，不能视为 51 首独立失败曲目。切回 Wi-Fi 高档后正常。当前日志中蜂窝档位仍为 4，需另外恢复为高档 3。
+
+原始 IPA 静态反汇编定位 `0x10A411B58`：它将协议错误转换成 NSError，在 reasons 非空的分支解析原因并写入 `kSPTPlayerErrorDisallowReasonsKey`，设置 code=101（`0x10A411C6C`）；无 reasons 的分支为 100。格式串是 `The action is disallowed because %@`。这说明至少该转换路径中的 101 携带进一步原因，不应解释成 HTTP 101 或直接当作服务端授权拒绝。
+
+0.5 在现有错误观察中仅增加上述字段和 `kSPTPlayerErrorNameKey` 的读取：仅导出受限原因标识、数值、容器形状及固定语义字段；原始 JSON、URL、ID、凭证、描述、完整 userInfo 均不导出。原生能力补丁和音质修改策略完全沿用 0.3。再次出现错误时无需长时间连续跳歌，立即暂停、切回高档并导出日志中的 `PLAYBACK_REASON`。

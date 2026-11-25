@@ -169,6 +169,46 @@ static NSString *safeErrorDomain(NSString *domain) {
     return [domain rangeOfCharacterFromSet:allowed.invertedSet].location==NSNotFound?domain:@"redacted";
 }
 
+static BOOL reasonToken(id value) {
+    if (![value isKindOfClass:NSString.class] || ![value length] || [value length]>96) return NO;
+    static NSCharacterSet *allowed;
+    static dispatch_once_t once;
+    dispatch_once(&once,^{allowed=[NSCharacterSet characterSetWithCharactersInString:@"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_- "];});
+    // Reason names only; no URI, identifier digits, punctuation or arbitrary text.
+    return [value rangeOfCharacterFromSet:allowed.invertedSet].location==NSNotFound &&
+        ([value rangeOfString:@"_"].location!=NSNotFound || [@[@"Forbidden",@"Not found",@"Conflict",@"Unknown",@"unknown",@"forbidden",@"restricted",@"unavailable",@"premium",@"free",@"true",@"false"] containsObject:value]);
+}
+
+static void observeReasonValue(id value,NSString *source,NSString *path,unsigned depth) {
+    if (!value || depth>4) return;
+    NSString *stateKey=[NSString stringWithFormat:@"reason %@ %@",source,path];
+    if ([value isKindOfClass:NSNumber.class]) {
+        recordState(stateKey,[NSString stringWithFormat:@"PLAYBACK_REASON source=%@ %@=%@",source,path,value]);
+    } else if ([value isKindOfClass:NSString.class]) {
+        if (reasonToken(value)) {
+            recordState(stateKey,[NSString stringWithFormat:@"PLAYBACK_REASON source=%@ %@=%@",source,path,value]);
+        } else if ([value length]<=4096 && ([value hasPrefix:@"{"] || [value hasPrefix:@"["])) {
+            id decoded=[NSJSONSerialization JSONObjectWithData:[value dataUsingEncoding:NSUTF8StringEncoding] options:0 error:NULL];
+            if (decoded) observeReasonValue(decoded,source,path,depth+1);
+        } else recordState(stateKey,[NSString stringWithFormat:@"PLAYBACK_REASON source=%@ %@=redacted_non_enum_string",source,path]);
+    } else if ([value isKindOfClass:NSArray.class]) {
+        recordState([stateKey stringByAppendingString:@" shape"],[NSString stringWithFormat:@"PLAYBACK_REASON source=%@ %@ array_count=%lu",source,path,(unsigned long)[value count]]);
+        NSUInteger limit=MIN((NSUInteger)16,[value count]);
+        for (NSUInteger i=0;i<limit;i++) observeReasonValue(value[i],source,[path stringByAppendingFormat:@"[%lu]",(unsigned long)i],depth+1);
+    } else if ([value isKindOfClass:NSDictionary.class]) {
+        // Read only semantic diagnostic keys; never export a whole dictionary.
+        NSArray *keys=@[@"reason",@"reasons",@"disallow_reason",@"disallow_reasons",@"error",@"errors",@"code",@"error_code",@"type",@"name",@"category",@"status",@"http_status",@"restriction",@"restrictions",@"context",@"data"];
+        NSMutableArray *present=NSMutableArray.new;
+        for (NSString *key in keys) if (value[key]) {
+            [present addObject:key];
+            observeReasonValue(value[key],source,[path stringByAppendingFormat:@".%@",key],depth+1);
+        }
+        recordState([stateKey stringByAppendingString:@" shape"],[NSString stringWithFormat:@"PLAYBACK_REASON source=%@ %@ dictionary_count=%lu allowed_keys=%@",source,path,(unsigned long)[value count],[present componentsJoinedByString:@","]]);
+    } else {
+        recordState(stateKey,[NSString stringWithFormat:@"PLAYBACK_REASON source=%@ %@ unsupported_class=%@",source,path,NSStringFromClass(object_getClass(value))]);
+    }
+}
+
 static void observePlaybackError(NSString *source,id error) {
     atomic_fetch_add(&playbackErrors,1);
     if (![error isKindOfClass:NSError.class]) {
@@ -179,6 +219,14 @@ static void observePlaybackError(NSString *source,id error) {
     for (unsigned depth=0;current && depth<3;depth++) {
         NSString *line=[NSString stringWithFormat:@"PLAYBACK_ERROR source=%@ depth=%u domain=%@ code=%ld",source,depth,safeErrorDomain(current.domain),(long)current.code];
         recordState([NSString stringWithFormat:@"playback error %@ %u",source,depth],line);
+        if ([current.domain isEqual:@"com.spotify.SPTPlayer"]) {
+            NSDictionary *info=current.userInfo;
+            id reasons=info[@"kSPTPlayerErrorDisallowReasonsKey"];
+            id name=info[@"kSPTPlayerErrorNameKey"];
+            recordState([NSString stringWithFormat:@"reason presence %@ %u",source,depth],[NSString stringWithFormat:@"PLAYBACK_REASON_FIELDS source=%@ depth=%u disallow_present=%@ name_present=%@",source,depth,reasons?@"yes":@"no",name?@"yes":@"no"]);
+            observeReasonValue(reasons,source,[NSString stringWithFormat:@"depth%u.disallow",depth],0);
+            observeReasonValue(name,source,[NSString stringWithFormat:@"depth%u.name",depth],0);
+        }
         id underlying=current.userInfo[NSUnderlyingErrorKey];
         if (![underlying isKindOfClass:NSError.class] || underlying==current) break;
         current=underlying;
@@ -390,7 +438,7 @@ static void writeQuality(NSInteger value) {
 @implementation QLController
 + (void)show {
     NSString *nativeNote=nativeCapabilityVerified?@"此包含固定原生能力补丁；关闭属性修改不会撤销，需原包恢复。":@"未确认原生能力补丁。";
-    UIAlertController *menu = [UIAlertController alertControllerWithTitle:@"Quality Lab 0.4 · 错误诊断版" message:[NSString stringWithFormat:@"当前：%@\n%@\n实际音源质量：尚未验证。", experiment ? @"尝试修改客户端属性" : @"观察本地读值",nativeNote] preferredStyle:UIAlertControllerStyleActionSheet];
+    UIAlertController *menu = [UIAlertController alertControllerWithTitle:@"Quality Lab 0.5 · 原因诊断版" message:[NSString stringWithFormat:@"当前：%@\n%@\n实际音源质量：尚未验证。", experiment ? @"尝试修改客户端属性" : @"观察本地读值",nativeNote] preferredStyle:UIAlertControllerStyleActionSheet];
     [menu addAction:[UIAlertAction actionWithTitle:@"读取当前状态（不修改）" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
         message(snapshot(@"manual-read-current"));
     }]];
@@ -448,7 +496,7 @@ __attribute__((constructor)) static void startQualityLab(void) {
         NSDictionary *info=NSBundle.mainBundle.infoDictionary;
         if (![info[@"CFBundleExecutable"] isEqual:@"Spotify"]) return;
         experiment=[NSUserDefaults.standardUserDefaults boolForKey:@"QualityLabExperiment"];
-        record([NSString stringWithFormat:@"QualityLab 0.4 app=%@ build=%@ mode=%@; actual source quality UNKNOWN",info[@"CFBundleShortVersionString"],info[@"CFBundleVersion"],experiment?@"experiment":@"observation"]);
+        record([NSString stringWithFormat:@"QualityLab 0.5 app=%@ build=%@ mode=%@; actual source quality UNKNOWN",info[@"CFBundleShortVersionString"],info[@"CFBundleVersion"],experiment?@"experiment":@"observation"]);
         if (![info[@"CFBundleShortVersionString"] isEqual:@"9.2.2"]) {
             record(@"Unsupported version: hooks disabled");
         } else {
