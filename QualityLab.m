@@ -7,7 +7,7 @@
 // Standalone experiment. No Substrate dependency and no network interception.
 static __weak id preferences;
 static NSMutableArray<NSString *> *events;
-static NSMutableSet<NSString *> *seen;
+static NSMutableDictionary<NSString *, NSString *> *lastStates;
 static NSLock *eventLock;
 static atomic_bool experiment;
 static UIButton *labButton;
@@ -15,11 +15,19 @@ static NSString *const prefsClass = @"_TtC31Preferences_CorePreferencesImpl28SPT
 
 static void record(NSString *line) {
     [eventLock lock];
-    if (![seen containsObject:line]) {
-        [seen addObject:line];
+    [events addObject:[NSString stringWithFormat:@"%@ %@", NSDate.date, line]];
+    if (events.count > 2000) [events removeObjectAtIndex:0];
+    [eventLock unlock];
+}
+
+// Suppress consecutive equal values per object/field, not every value ever seen.
+// A -> B -> A must emit all three transitions. Explicit snapshots never dedupe.
+static void recordState(NSString *key, NSString *line) {
+    [eventLock lock];
+    if (![lastStates[key] isEqual:line]) {
+        lastStates[key] = line;
         [events addObject:[NSString stringWithFormat:@"%@ %@", NSDate.date, line]];
-        if (events.count > 600) [events removeObjectAtIndex:0];
-        if (seen.count > 1200) [seen removeAllObjects];
+        if (events.count > 2000) [events removeObjectAtIndex:0];
     }
     [eventLock unlock];
 }
@@ -62,7 +70,7 @@ static id productDictionary(id original) {
     for (NSString *key in @[@"type", @"product", @"catalogue", @"high-bitrate", @"very-high-bitrate", @"audio-quality"]) {
         id value = input[key];
         if ([value isKindOfClass:NSString.class] || [value isKindOfClass:NSNumber.class])
-            record([NSString stringWithFormat:@"account ORIGINAL %@=%@", key, value]);
+            recordState([@"account dictionary " stringByAppendingString:key], [NSString stringWithFormat:@"account LOCAL_INPUT %@=%@ (may include earlier local rewrites)", key, value]);
     }
     if (!experiment) return original;
     NSMutableDictionary *result = input.mutableCopy;
@@ -83,7 +91,7 @@ static void hookProduct(void) {
             id value = ((id(*)(id,SEL,id))original)(object,selector,key);
             if ([key isKindOfClass:NSString.class] && relevantKey(key) &&
                 ([value isKindOfClass:NSString.class] || [value isKindOfClass:NSNumber.class]))
-                record([NSString stringWithFormat:@"account ORIGINAL %@=%@",key,value]);
+                recordState([NSString stringWithFormat:@"account %p %@ %@", (__bridge void *)object,name,key], [NSString stringWithFormat:@"account LOCAL_INPUT %@ %@=%@", name,key,value]);
             return forcedValue(key) ?: value;
         });
         replace(cls, selector, replacement, method);
@@ -110,7 +118,7 @@ static void hookPreferences(void) {
         replace(cls, selector, imp_implementationWithBlock(^NSInteger(id object) {
             preferences = object;
             NSInteger value = ((NSInteger(*)(id,SEL))original)(object,selector);
-            record([NSString stringWithFormat:@"native %@=%ld", name, (long)value]);
+            recordState([NSString stringWithFormat:@"native %p %@", (__bridge void *)object,name], [NSString stringWithFormat:@"native object=%p %@=%ld", (__bridge void *)object,name,(long)value]);
             return value;
         }), method);
     }
@@ -121,7 +129,7 @@ static void hookPreferences(void) {
         IMP original = method_getImplementation(method);
         replace(cls, selector, imp_implementationWithBlock(^(id object, NSInteger value) {
             preferences = object;
-            record([NSString stringWithFormat:@"native %@ %ld", name, (long)value]);
+            record([NSString stringWithFormat:@"native SET object=%p %@ %ld", (__bridge void *)object,name,(long)value]);
             ((void(*)(id,SEL,NSInteger))original)(object,selector,value);
         }), method);
     }
@@ -133,7 +141,7 @@ static void observeMetadata(id value) {
     for (NSString *key in @[@"source_is_lossless", @"audio_quality", @"bitrate", @"audio_bitrate", @"codec", @"codec_name", @"file_type", @"sample_rate", @"bits_per_sample"]) {
         id item = value[key];
         if ([item isKindOfClass:NSString.class] || [item isKindOfClass:NSNumber.class])
-            record([NSString stringWithFormat:@"player METADATA %@=%@ (reported; not independently verified)",key,item]);
+            recordState([@"metadata " stringByAppendingString:key], [NSString stringWithFormat:@"player METADATA %@=%@ (reported; not independently verified)",key,item]);
     }
 }
 
@@ -182,6 +190,37 @@ static void message(NSString *text) {
     [presenter() presentViewController:alert animated:YES completion:nil];
 }
 
+static NSString *snapshot(NSString *reason) {
+    id object = preferences;
+    NSMutableArray<NSString *> *lines=NSMutableArray.new;
+    [lines addObject:[NSString stringWithFormat:@"SNAPSHOT %@ mode=%@ object=%p class=%@",reason,experiment?@"experiment":@"observation",(__bridge void *)object,object?NSStringFromClass(object_getClass(object)):@"none"]];
+    if (!object) [lines addObject:@"No preferences object captured. Open the native quality page first."];
+    else for (NSString *name in @[@"audioPlayBitrate",@"audioPlayBitrateNonMetered",@"audioSyncBitrate"]) {
+        SEL selector=NSSelectorFromString(name);
+        if (abi(class_getInstanceMethod(object_getClass(object),selector),@encode(NSInteger),NULL))
+            [lines addObject:[NSString stringWithFormat:@"SNAPSHOT %@=%ld",name,(long)((NSInteger(*)(id,SEL))objc_msgSend)(object,selector)]];
+    }
+    for (NSString *line in lines) record(line);
+    return [lines componentsJoinedByString:@"\n"];
+}
+
+static void describeInterfaces(void) {
+    // Method names/signatures only; never invoke unknown selectors or log data.
+    for (NSString *name in @[@"SPTCoreProductState",prefsClass,@"_TtC20Lossless_SettingsKit38UbiquityAudioQualitySettingsController",@"StreamQualitySettingsSection"]) {
+        Class cls=NSClassFromString(name);
+        record([NSString stringWithFormat:@"INTERFACE %@ %@",name,cls?@"present":@"absent"]);
+        if (!cls) continue;
+        unsigned count=0; Method *methods=class_copyMethodList(cls,&count);
+        for (unsigned i=0;i<count;i++) {
+            NSString *methodName=NSStringFromSelector(method_getName(methods[i]));
+            NSString *lower=methodName.lowercaseString;
+            BOOL relevant=[lower containsString:@"bitrate"] || [lower containsString:@"quality"] || [lower containsString:@"premium"] || [lower containsString:@"forkey"] || [lower containsString:@"lossless"];
+            if (relevant) record([NSString stringWithFormat:@"INTERFACE %@ %@ ABI=%s",name,methodName,method_getTypeEncoding(methods[i])]);
+        }
+        free(methods);
+    }
+}
+
 static void writeQuality(NSInteger value) {
     id object = preferences;
     if (!object) { message(@"尚未捕获原生偏好对象。先打开 Spotify 音质设置，再重试。未写入任何值。"); return; }
@@ -200,6 +239,12 @@ static void writeQuality(NSInteger value) {
         if (abi(class_getInstanceMethod(object_getClass(object),selector),@encode(NSInteger),NULL))
             record([NSString stringWithFormat:@"READBACK %@=%ld",name,(long)((NSInteger(*)(id,SEL))objc_msgSend)(object,selector)]);
     }
+    snapshot(@"immediate-after-write");
+    for (NSNumber *delay in @[@5,@20]) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,delay.longLongValue*NSEC_PER_SEC),dispatch_get_main_queue(),^{
+            snapshot([NSString stringWithFormat:@"%@s-after-write requested=%ld",delay,(long)value]);
+        });
+    }
     message(@"已调用原生音质设置。请重新打开音质页核对标签，再切换一首未缓存的歌曲。写入成功不代表服务端接受或实际播放达到该音质。");
 }
 
@@ -208,7 +253,10 @@ static void writeQuality(NSInteger value) {
 @end
 @implementation QLController
 + (void)show {
-    UIAlertController *menu = [UIAlertController alertControllerWithTitle:@"Quality Lab · 实验版" message:[NSString stringWithFormat:@"当前：%@\n实际音源质量：尚未验证\n枚举 3/4/5 需用本机设置标签核对。", experiment ? @"尝试修改客户端属性" : @"只观察"] preferredStyle:UIAlertControllerStyleActionSheet];
+    UIAlertController *menu = [UIAlertController alertControllerWithTitle:@"Quality Lab 0.2 · 实验版" message:[NSString stringWithFormat:@"当前：%@\n实际音源质量：尚未验证\n枚举 3/4/5 需用本机设置标签核对。", experiment ? @"尝试修改客户端属性" : @"只观察"] preferredStyle:UIAlertControllerStyleActionSheet];
+    [menu addAction:[UIAlertAction actionWithTitle:@"读取当前状态（不修改）" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+        message(snapshot(@"manual-read-current"));
+    }]];
     [menu addAction:[UIAlertAction actionWithTitle:experiment ? @"关闭属性修改（随后重启）" : @"启用属性修改（随后重启）" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
         experiment = !experiment;
         [NSUserDefaults.standardUserDefaults setBool:experiment forKey:@"QualityLabExperiment"];
@@ -221,6 +269,8 @@ static void writeQuality(NSInteger value) {
         [menu addAction:[UIAlertAction actionWithTitle:names[i] style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) { writeQuality(value); }]];
     }
     [menu addAction:[UIAlertAction actionWithTitle:@"导出诊断日志" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+        snapshot(@"before-export");
+        describeInterfaces();
         [eventLock lock]; NSString *log=[events componentsJoinedByString:@"\n"]; [eventLock unlock];
         NSURL *url=[NSURL fileURLWithPath:[NSTemporaryDirectory() stringByAppendingPathComponent:@"QualityLab.txt"]];
         NSError *error=nil;
@@ -257,11 +307,11 @@ static void attachButton(void) {
 
 __attribute__((constructor)) static void startQualityLab(void) {
     @autoreleasepool {
-        eventLock=NSLock.new; events=NSMutableArray.new; seen=NSMutableSet.new;
+        eventLock=NSLock.new; events=NSMutableArray.new; lastStates=NSMutableDictionary.new;
         NSDictionary *info=NSBundle.mainBundle.infoDictionary;
         if (![info[@"CFBundleExecutable"] isEqual:@"Spotify"]) return;
         experiment=[NSUserDefaults.standardUserDefaults boolForKey:@"QualityLabExperiment"];
-        record([NSString stringWithFormat:@"QualityLab 0.1 app=%@ build=%@ mode=%@; actual source quality UNKNOWN",info[@"CFBundleShortVersionString"],info[@"CFBundleVersion"],experiment?@"experiment":@"observation"]);
+        record([NSString stringWithFormat:@"QualityLab 0.2 app=%@ build=%@ mode=%@; actual source quality UNKNOWN",info[@"CFBundleShortVersionString"],info[@"CFBundleVersion"],experiment?@"experiment":@"observation"]);
         if (![info[@"CFBundleShortVersionString"] isEqual:@"9.2.2"]) {
             record(@"Unsupported version: hooks disabled");
         } else {
