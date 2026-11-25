@@ -6,6 +6,12 @@ on:
 permissions:
   contents: read
 jobs:
+  packaging-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate load-command injection on synthetic Mach-O fixtures
+        run: python3 -m unittest discover -s tools -p 'test_*.py' -v
   build:
     runs-on: macos-15-intel
     steps:
