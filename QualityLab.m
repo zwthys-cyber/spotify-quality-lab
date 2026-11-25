@@ -203,6 +203,18 @@ static void observeReasonValue(id value,NSString *source,NSString *path,unsigned
             [present addObject:key];
             observeReasonValue(value[key],source,[path stringByAppendingFormat:@".%@",key],depth+1);
         }
+        // Some reasons are maps whose enum-like keys are the actual reason
+        // names. Keep bounded diagnostic labels, never identifier/token keys.
+        NSArray *excluded=@[@"track_uri",@"track_id",@"file_id",@"playback_id",@"session_id",@"user_id",@"url",@"uri",@"id",@"message",@"description"];
+        unsigned labels=0;
+        for (id key in value) {
+            if (labels>=16) break;
+            if (!reasonToken(key) || [present containsObject:key]) continue;
+            NSString *lower=[key lowercaseString];
+            if ([excluded containsObject:lower] || [lower containsString:@"token"] || [lower containsString:@"secret"] || [lower containsString:@"authorization"]) continue;
+            [present addObject:key]; labels++;
+            observeReasonValue(value[key],source,[path stringByAppendingFormat:@".%@",key],depth+1);
+        }
         recordState([stateKey stringByAppendingString:@" shape"],[NSString stringWithFormat:@"PLAYBACK_REASON source=%@ %@ dictionary_count=%lu allowed_keys=%@",source,path,(unsigned long)[value count],[present componentsJoinedByString:@","]]);
     } else {
         recordState(stateKey,[NSString stringWithFormat:@"PLAYBACK_REASON source=%@ %@ unsupported_class=%@",source,path,NSStringFromClass(object_getClass(value))]);
