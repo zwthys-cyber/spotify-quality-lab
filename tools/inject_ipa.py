@@ -4,11 +4,16 @@ The output requires signing on the user's device. Refuses binaries without
 enough unused load-command padding; never shifts executable sections.
 """
 import argparse
+import copy
+import hashlib
+import os
+import shutil
+import tempfile
 from pathlib import Path
 import plistlib
 import struct
 import zipfile
-from native_capability import patch_native_capability
+from native_capability import EXPECTED_SHA256, PATCH_OFFSET, ORIGINAL_PROLOGUE, PATCH_BYTES
 
 
 def inject(binary, library_path):
@@ -57,22 +62,16 @@ def inject(binary, library_path):
     return bytes(result)
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('ipa', type=Path)
-    parser.add_argument('dylib', type=Path)
-    parser.add_argument('output', type=Path)
-    parser.add_argument('--native-capability-2', action='store_true',
-                        help='Patch the exact original 9.2.2 native capability getter; always active until original IPA is restored')
-    args = parser.parse_args()
-    if args.output.resolve() == args.ipa.resolve() or args.output.exists():
+def package_ipa(ipa, dylib, destination, native_capability_2=False):
+    ipa, dylib, destination = Path(ipa), Path(dylib), Path(destination)
+    if destination.resolve() == ipa.resolve() or destination.exists():
         raise ValueError('Output must be a new file')
-    library = args.dylib.read_bytes()
+    library = dylib.read_bytes()
     if len(library) < 32 or struct.unpack_from('<III', library) != (0xFEEDFACF, 0x100000C, 0):
         raise ValueError('Expected thin arm64 dylib')
     if struct.unpack_from('<I', library, 12)[0] != 6:
         raise ValueError('Expected MH_DYLIB')
-    with zipfile.ZipFile(args.ipa) as source:
+    with tempfile.TemporaryDirectory(prefix='qualitylab-package-') as temporary, zipfile.ZipFile(ipa) as source:
         infos = [n for n in source.namelist() if n.endswith('.app/Info.plist') and n.count('/') == 2]
         if len(infos) != 1:
             raise ValueError('Expected one main app')
@@ -84,25 +83,65 @@ def main():
         target = app + '/Frameworks/QualityLab.dylib'
         if target in source.namelist():
             raise ValueError('Target library already exists')
-        original = source.read(executable)
-        if args.native_capability_2:
-            original = patch_native_capability(original)
-            info['QualityLabNativeCapability'] = 2
-        patched = inject(original, '@executable_path/Frameworks/QualityLab.dylib')
-        with zipfile.ZipFile(args.output, 'x', zipfile.ZIP_DEFLATED, compresslevel=6) as output:
-            for entry in source.infolist():
-                if entry.filename.startswith(app + '/_CodeSignature/'):
-                    continue
-                data = source.read(entry)
-                if entry.filename == executable:
-                    data = patched
-                elif entry.filename == infos[0] and args.native_capability_2:
-                    data = plistlib.dumps(info, fmt=plistlib.FMT_BINARY)
-                output.writestr(entry, data)
-            entry = zipfile.ZipInfo(target)
-            entry.external_attr = 0o100755 << 16
-            entry.compress_type = zipfile.ZIP_DEFLATED
-            output.writestr(entry, library)
+        executable_file = Path(temporary) / 'Spotify'
+        digest = hashlib.sha256()
+        with source.open(executable) as incoming, executable_file.open('wb') as outgoing:
+            while block := incoming.read(1024 * 1024):
+                digest.update(block)
+                outgoing.write(block)
+        with executable_file.open('r+b') as stream:
+            if native_capability_2:
+                if digest.hexdigest() != EXPECTED_SHA256:
+                    raise ValueError('Native capability patch: executable digest mismatch')
+                stream.seek(PATCH_OFFSET)
+                if stream.read(len(ORIGINAL_PROLOGUE)) != ORIGINAL_PROLOGUE:
+                    raise ValueError('Native capability patch: original code mismatch')
+                stream.seek(PATCH_OFFSET)
+                stream.write(PATCH_BYTES)
+                info['QualityLabNativeCapability'] = 2
+            # Only the header and its existing padding are needed. Keep the
+            # remaining 250 MB on disk instead of allocating several copies.
+            stream.seek(0)
+            prefix = stream.read(1024 * 1024)
+            patched_prefix = inject(prefix, '@executable_path/Frameworks/QualityLab.dylib')
+            stream.seek(0)
+            stream.write(patched_prefix)
+        with tempfile.NamedTemporaryFile(dir=destination.parent, prefix=destination.name + '.', suffix='.partial', delete=False) as handle:
+            partial = Path(handle.name)
+        try:
+            with zipfile.ZipFile(partial, 'w', zipfile.ZIP_DEFLATED, compresslevel=1) as output:
+                for original_entry in source.infolist():
+                    if original_entry.filename.startswith(app + '/_CodeSignature/'):
+                        continue
+                    entry = copy.copy(original_entry)
+                    entry._compresslevel = 1
+                    if entry.filename == infos[0] and native_capability_2:
+                        output.writestr(entry, plistlib.dumps(info, fmt=plistlib.FMT_BINARY))
+                        continue
+                    incoming = executable_file.open('rb') if entry.filename == executable else source.open(original_entry)
+                    with incoming, output.open(entry, 'w') as outgoing:
+                        shutil.copyfileobj(incoming, outgoing, length=1024 * 1024)
+                entry = zipfile.ZipInfo(target)
+                entry.external_attr = 0o100755 << 16
+                entry.compress_type = zipfile.ZIP_DEFLATED
+                entry._compresslevel = 1
+                output.writestr(entry, library)
+            if destination.exists():
+                raise ValueError('Output appeared while packaging; refusing overwrite')
+            os.replace(partial, destination)
+        finally:
+            partial.unlink(missing_ok=True)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('ipa', type=Path)
+    parser.add_argument('dylib', type=Path)
+    parser.add_argument('output', type=Path)
+    parser.add_argument('--native-capability-2', action='store_true',
+                        help='Patch the exact original 9.2.2 native capability getter; always active until original IPA is restored')
+    args = parser.parse_args()
+    package_ipa(args.ipa, args.dylib, args.output, args.native_capability_2)
     print(f'Packaged {args.output}; must be re-signed before installation')
 
 

@@ -2,3 +2,5 @@ dist/
 *.zip
 *.ipa
 *.dylib
+__pycache__/
+*.partial
