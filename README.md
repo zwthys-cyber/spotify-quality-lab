@@ -1,4 +1,4 @@
-# Quality Lab 0.5 — Spotify 9.2.2 experiment
+# Quality Lab 0.6 — Spotify 9.2.2 experiment
 
 实验插件，不是已验证的超高／无损解锁。编译仅在 GitHub Actions macOS runner 执行；没有在本地编译或测试。只依赖系统 Foundation/UIKit，可用全能签向解密的 9.2.2 IPA 注入 `QualityLab.dylib`，然后重新签名安装。安装成功与音质解锁是两项独立结果。
 
@@ -52,3 +52,7 @@
 原始 IPA 静态反汇编定位 `0x10A411B58`：它将协议错误转换成 NSError，在 reasons 非空的分支解析原因并写入 `kSPTPlayerErrorDisallowReasonsKey`，设置 code=101（`0x10A411C6C`）；无 reasons 的分支为 100。格式串是 `The action is disallowed because %@`。这说明至少该转换路径中的 101 携带进一步原因，不应解释成 HTTP 101 或直接当作服务端授权拒绝。
 
 0.5 在现有错误观察中仅增加上述字段和 `kSPTPlayerErrorNameKey` 的读取：仅导出受限原因标识、数值、容器形状及固定语义字段；原始 JSON、URL、ID、凭证、描述、完整 userInfo 均不导出。原生能力补丁和音质修改策略完全沿用 0.3。再次出现错误时无需长时间连续跳歌，立即暂停、切回高档并导出日志中的 `PLAYBACK_REASON`。
+
+## 0.6 集合读取修复
+
+实机确认 `disallow_present=yes` 且错误名为 `one_track_unplayable`；具体原因是单元素 NSSet（`__NSSingleObjectSetI`），0.5 漏掉 NSSet 支持，仅输出不支持的类名。0.6 读取最多 16 个集合元素，保持原有隐私筛选和深度上限。GitHub macOS runner 从实际源码提取格式化函数，验证单元素集合、数字原因、嵌套集合及敏感字段筛选、数组兼容性；本机不执行该检查，不编译 App 或插件。音质修改逻辑不变。

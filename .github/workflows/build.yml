@@ -16,6 +16,8 @@ jobs:
     runs-on: macos-15-intel
     steps:
       - uses: actions/checkout@v4
+      - name: Check actual reason formatter with NSSet and private-field fixtures
+        run: python3 tests/reason_diagnostics.py
       - name: Compile arm64 device dylib
         run: |
           mkdir -p dist

@@ -191,6 +191,15 @@ static void observeReasonValue(id value,NSString *source,NSString *path,unsigned
             id decoded=[NSJSONSerialization JSONObjectWithData:[value dataUsingEncoding:NSUTF8StringEncoding] options:0 error:NULL];
             if (decoded) observeReasonValue(decoded,source,path,depth+1);
         } else recordState(stateKey,[NSString stringWithFormat:@"PLAYBACK_REASON source=%@ %@=redacted_non_enum_string",source,path]);
+    } else if ([value isKindOfClass:NSSet.class]) {
+        NSSet *reasons=value;
+        recordState([stateKey stringByAppendingString:@" shape"],[NSString stringWithFormat:@"PLAYBACK_REASON source=%@ %@ set_count=%lu",source,path,(unsigned long)reasons.count]);
+        NSUInteger index=0;
+        for (id reason in reasons) {
+            if (index>=16) break;
+            observeReasonValue(reason,source,[path stringByAppendingFormat:@"[%lu]",(unsigned long)index],depth+1);
+            index++;
+        }
     } else if ([value isKindOfClass:NSArray.class]) {
         recordState([stateKey stringByAppendingString:@" shape"],[NSString stringWithFormat:@"PLAYBACK_REASON source=%@ %@ array_count=%lu",source,path,(unsigned long)[value count]]);
         NSUInteger limit=MIN((NSUInteger)16,[value count]);
@@ -450,7 +459,7 @@ static void writeQuality(NSInteger value) {
 @implementation QLController
 + (void)show {
     NSString *nativeNote=nativeCapabilityVerified?@"此包含固定原生能力补丁；关闭属性修改不会撤销，需原包恢复。":@"未确认原生能力补丁。";
-    UIAlertController *menu = [UIAlertController alertControllerWithTitle:@"Quality Lab 0.5 · 原因诊断版" message:[NSString stringWithFormat:@"当前：%@\n%@\n实际音源质量：尚未验证。", experiment ? @"尝试修改客户端属性" : @"观察本地读值",nativeNote] preferredStyle:UIAlertControllerStyleActionSheet];
+    UIAlertController *menu = [UIAlertController alertControllerWithTitle:@"Quality Lab 0.6 · 原因诊断版" message:[NSString stringWithFormat:@"当前：%@\n%@\n实际音源质量：尚未验证。", experiment ? @"尝试修改客户端属性" : @"观察本地读值",nativeNote] preferredStyle:UIAlertControllerStyleActionSheet];
     [menu addAction:[UIAlertAction actionWithTitle:@"读取当前状态（不修改）" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
         message(snapshot(@"manual-read-current"));
     }]];
@@ -508,7 +517,7 @@ __attribute__((constructor)) static void startQualityLab(void) {
         NSDictionary *info=NSBundle.mainBundle.infoDictionary;
         if (![info[@"CFBundleExecutable"] isEqual:@"Spotify"]) return;
         experiment=[NSUserDefaults.standardUserDefaults boolForKey:@"QualityLabExperiment"];
-        record([NSString stringWithFormat:@"QualityLab 0.5 app=%@ build=%@ mode=%@; actual source quality UNKNOWN",info[@"CFBundleShortVersionString"],info[@"CFBundleVersion"],experiment?@"experiment":@"observation"]);
+        record([NSString stringWithFormat:@"QualityLab 0.6 app=%@ build=%@ mode=%@; actual source quality UNKNOWN",info[@"CFBundleShortVersionString"],info[@"CFBundleVersion"],experiment?@"experiment":@"observation"]);
         if (![info[@"CFBundleShortVersionString"] isEqual:@"9.2.2"]) {
             record(@"Unsupported version: hooks disabled");
         } else {
