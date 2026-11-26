@@ -230,6 +230,39 @@ static void observeReasonValue(id value,NSString *source,NSString *path,unsigned
     }
 }
 
+// This is used only for kSPTPlayerErrorDisallowReasonsKey. The value has
+// already been identified as a disallow reason, so its typography must not
+// determine whether the reason is kept (e.g. NoFile, 101, or plain sentences).
+static NSString *disallowText(NSString *value) {
+    NSString *text=value.length>2048?[value substringToIndex:2048]:value;
+    NSArray *patterns=@[@"(?i)(?:https?://|spotify:)[^\\s]+",
+                         @"(?i)\\bBearer\\s+[^\\s]+",
+                         @"(?i)\\b(access_token|refresh_token|authorization|token)\\s*[:=]\\s*[^\\s,;]+"];
+    NSArray *replacements=@[@"<url>",@"Bearer <token>",@"$1=<token>"];
+    for (NSUInteger i=0;i<patterns.count;i++) {
+        NSRegularExpression *regex=[NSRegularExpression regularExpressionWithPattern:patterns[i] options:0 error:NULL];
+        text=[regex stringByReplacingMatchesInString:text options:0 range:NSMakeRange(0,text.length) withTemplate:replacements[i]];
+    }
+    text=[text stringByReplacingOccurrencesOfString:@"\r" withString:@"\\r"];
+    text=[text stringByReplacingOccurrencesOfString:@"\n" withString:@"\\n"];
+    return [text stringByReplacingOccurrencesOfString:@"\t" withString:@"\\t"];
+}
+
+static void observeDisallowReason(id value,NSString *source,NSString *path,unsigned depth) {
+    if (!value || depth>4) return;
+    if ([value isKindOfClass:NSString.class]) {
+        recordState([NSString stringWithFormat:@"reason text %@ %@",source,path],[NSString stringWithFormat:@"PLAYBACK_REASON_TEXT source=%@ %@=%@",source,path,disallowText(value)]);
+    } else if ([value isKindOfClass:NSSet.class] || [value isKindOfClass:NSArray.class]) {
+        recordState([NSString stringWithFormat:@"reason collection %@ %@",source,path],[NSString stringWithFormat:@"PLAYBACK_REASON_TEXT source=%@ %@ %@_count=%lu",source,path,[value isKindOfClass:NSSet.class]?@"set":@"array",(unsigned long)[value count]]);
+        NSUInteger index=0;
+        for (id item in value) {
+            if (index>=16) break;
+            observeDisallowReason(item,source,[path stringByAppendingFormat:@"[%lu]",(unsigned long)index],depth+1);
+            index++;
+        }
+    } else observeReasonValue(value,source,path,depth);
+}
+
 static void observePlaybackError(NSString *source,id error) {
     atomic_fetch_add(&playbackErrors,1);
     if (![error isKindOfClass:NSError.class]) {
@@ -245,7 +278,7 @@ static void observePlaybackError(NSString *source,id error) {
             id reasons=info[@"kSPTPlayerErrorDisallowReasonsKey"];
             id name=info[@"kSPTPlayerErrorNameKey"];
             recordState([NSString stringWithFormat:@"reason presence %@ %u",source,depth],[NSString stringWithFormat:@"PLAYBACK_REASON_FIELDS source=%@ depth=%u disallow_present=%@ name_present=%@",source,depth,reasons?@"yes":@"no",name?@"yes":@"no"]);
-            observeReasonValue(reasons,source,[NSString stringWithFormat:@"depth%u.disallow",depth],0);
+            observeDisallowReason(reasons,source,[NSString stringWithFormat:@"depth%u.disallow",depth],0);
             observeReasonValue(name,source,[NSString stringWithFormat:@"depth%u.name",depth],0);
         }
         id underlying=current.userInfo[NSUnderlyingErrorKey];
@@ -459,7 +492,7 @@ static void writeQuality(NSInteger value) {
 @implementation QLController
 + (void)show {
     NSString *nativeNote=nativeCapabilityVerified?@"此包含固定原生能力补丁；关闭属性修改不会撤销，需原包恢复。":@"未确认原生能力补丁。";
-    UIAlertController *menu = [UIAlertController alertControllerWithTitle:@"Quality Lab 0.6 · 原因诊断版" message:[NSString stringWithFormat:@"当前：%@\n%@\n实际音源质量：尚未验证。", experiment ? @"尝试修改客户端属性" : @"观察本地读值",nativeNote] preferredStyle:UIAlertControllerStyleActionSheet];
+    UIAlertController *menu = [UIAlertController alertControllerWithTitle:@"Quality Lab 0.7 · 原因诊断版" message:[NSString stringWithFormat:@"当前：%@\n%@\n实际音源质量：尚未验证。", experiment ? @"尝试修改客户端属性" : @"观察本地读值",nativeNote] preferredStyle:UIAlertControllerStyleActionSheet];
     [menu addAction:[UIAlertAction actionWithTitle:@"读取当前状态（不修改）" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
         message(snapshot(@"manual-read-current"));
     }]];
@@ -517,7 +550,7 @@ __attribute__((constructor)) static void startQualityLab(void) {
         NSDictionary *info=NSBundle.mainBundle.infoDictionary;
         if (![info[@"CFBundleExecutable"] isEqual:@"Spotify"]) return;
         experiment=[NSUserDefaults.standardUserDefaults boolForKey:@"QualityLabExperiment"];
-        record([NSString stringWithFormat:@"QualityLab 0.6 app=%@ build=%@ mode=%@; actual source quality UNKNOWN",info[@"CFBundleShortVersionString"],info[@"CFBundleVersion"],experiment?@"experiment":@"observation"]);
+        record([NSString stringWithFormat:@"QualityLab 0.7 app=%@ build=%@ mode=%@; actual source quality UNKNOWN",info[@"CFBundleShortVersionString"],info[@"CFBundleVersion"],experiment?@"experiment":@"observation"]);
         if (![info[@"CFBundleShortVersionString"] isEqual:@"9.2.2"]) {
             record(@"Unsupported version: hooks disabled");
         } else {

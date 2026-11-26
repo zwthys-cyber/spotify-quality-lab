@@ -1,4 +1,4 @@
-# Quality Lab 0.6 — Spotify 9.2.2 experiment
+# Quality Lab 0.7 — Spotify 9.2.2 experiment
 
 实验插件，不是已验证的超高／无损解锁。编译仅在 GitHub Actions macOS runner 执行；没有在本地编译或测试。只依赖系统 Foundation/UIKit，可用全能签向解密的 9.2.2 IPA 注入 `QualityLab.dylib`，然后重新签名安装。安装成功与音质解锁是两项独立结果。
 
@@ -56,3 +56,7 @@
 ## 0.6 集合读取修复
 
 实机确认 `disallow_present=yes` 且错误名为 `one_track_unplayable`；具体原因是单元素 NSSet（`__NSSingleObjectSetI`），0.5 漏掉 NSSet 支持，仅输出不支持的类名。0.6 读取最多 16 个集合元素，保持原有隐私筛选和深度上限。GitHub macOS runner 从实际源码提取格式化函数，验证单元素集合、数字原因、嵌套集合及敏感字段筛选、数组兼容性；本机不执行该检查，不编译 App 或插件。音质修改逻辑不变。
+
+## 0.7 保留已确认原因字段的文本
+
+实机 0.6 确认集合读取成功，但其中的字符串被过严的枚举名称筛选替换成 `redacted_non_enum_string`；日志未保存原值，不能从中还原原因。0.7 仅对已确认的 `kSPTPlayerErrorDisallowReasonsKey` 字符串去掉格式限制，保留最多 2048 字符，遮掉 URL、Bearer 值和常见 token 赋值，并转义换行。其他字典内容继续使用原有筛选。新增 GitHub 运行的实际源码回归检查：驼峰原因、数字字符串、普通句子、中文原因均能保留，嵌入的 URL/令牌会被遮掉。不得把这些测试示例当成手机实际返回的原因。

@@ -47,7 +47,19 @@ int main(void) {
         observeReasonValue(@[@"track_unavailable",@"https://private.example/secret"],@"fixture",@"disallow",0);
         require([output() containsString:@"track_unavailable"],@"array reason regressed");
         require(![output() containsString:@"private.example"],@"raw URL was exported");
-        puts("PASS: singleton set, numeric set, nested set privacy, and array compatibility");
+
+        for (NSString *reason in @[@"NoFile",@"101",@"Track not playable at the requested quality",@"格式不可用"]) {
+            [records removeAllObjects];
+            observeDisallowReason([NSSet setWithObject:reason],@"fixture",@"disallow",0);
+            require([output() containsString:reason],@"confirmed disallow text was lost to enum-name filtering");
+            require(![output() containsString:@"redacted_non_enum_string"],@"known reason field used old enum filter");
+        }
+        [records removeAllObjects];
+        observeDisallowReason([NSSet setWithObject:@"NoFile https://private.example/file?access_token=PRIVATE_A Bearer PRIVATE_B token=PRIVATE_C"],@"fixture",@"disallow",0);
+        require([output() containsString:@"NoFile"],@"URL scrubbing lost the error reason");
+        require(![output() containsString:@"PRIVATE"],@"URL or token embedded in reason was exported");
+        require(![output() containsString:@"private.example"],@"reason URL was exported");
+        puts("PASS: singleton sets, numeric/text/camel-case/Unicode reasons, URL/token scrubbing, nested privacy, and arrays");
     }
     return 0;
 }
